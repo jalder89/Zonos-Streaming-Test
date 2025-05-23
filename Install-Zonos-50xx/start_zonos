@@ -1,0 +1,6 @@
+#!/bin/bash
+
+echo "Starting Zonos..."
+cd /home/dwemer/Zonos
+source ./bin/activate
+python3 gradio_interface.py

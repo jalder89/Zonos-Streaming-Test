@@ -1,0 +1,30 @@
+#!/bin/bash
+
+check_error() {
+  if [ $? -ne 0 ]; then
+    echo -e "\e[41mError:\e[0m $1"
+    echo "Press Enter to exit..."
+    read
+    exit 1
+  fi
+}
+
+cd /home/dwemer
+git clone https://github.com/Zyphra/Zonos.git
+cd Zonos
+
+python3 -m venv .
+source ./bin/activate
+
+pip install -e .
+check_error "Failed to install required pip packages."
+
+pip uninstall -y torch torchaudio
+pip install --pre -U torch torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+check_error "Failed to install required pip packages."
+
+# Install additional dependencies for HerikaServer streaming integration
+pip install fastapi uvicorn
+check_error "Failed to install streaming service dependencies."
+
+deactivate
