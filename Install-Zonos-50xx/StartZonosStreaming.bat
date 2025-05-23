@@ -1,11 +1,29 @@
 @echo off
 echo Starting Zonos Streaming Service for HerikaServer...
 echo.
-echo Copying streaming service to WSL...
-copy /y ..\HerikaServer-Streaming-Test\zonos_streaming_service.py \\wsl.localhost\DwemerAI4Skyrim3\home\dwemer\Zonos
+echo This will start Zonos in streaming mode for HerikaServer integration.
+echo The service will run on port 8765 and stay open until you close it.
+echo.
 
-echo Starting streaming service...
-copy /y start_zonos_streaming \\wsl.localhost\DwemerAI4Skyrim3\home\dwemer\Zonos
+echo Copying startup script to WSL...
+copy /y start_zonos_streaming \\wsl.localhost\DwemerAI4Skyrim3\home\dwemer\Zonos >nul 2>&1
+if errorlevel 1 (
+    echo Error: Could not copy startup script to WSL
+    echo Please ensure the DwemerAI4Skyrim3 WSL distribution is running
+    pause
+    exit /b 1
+)
+
+echo Setting permissions...
 wsl -d DwemerAI4Skyrim3 -- chown dwemer:dwemer /home/dwemer/Zonos/start_zonos_streaming
 wsl -d DwemerAI4Skyrim3 -- chmod +x /home/dwemer/Zonos/start_zonos_streaming
+
+echo.
+echo Starting Zonos Streaming Service...
+echo Service will be available at: http://localhost:8765
+echo.
 wsl -d DwemerAI4Skyrim3 -u dwemer -- /home/dwemer/Zonos/start_zonos_streaming
+
+echo.
+echo Service stopped. Press any key to exit.
+pause
