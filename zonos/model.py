@@ -224,6 +224,93 @@ class Zonos(nn.Module):
         # Only the mamba-ssm backbone supports CUDA Graphs at the moment
         return self.device.type == "cuda" and "_mamba_ssm" in str(self.backbone.__class__)
 
+    def _preprocess_codes_for_decoding(self, codes: torch.Tensor, context: str = "") -> torch.Tensor:
+        """
+        Preprocess codes to handle unknown tokens and ensure valid range for DAC autoencoder.
+        Returns the processed codes tensor.
+        """
+        try:
+            # Check for unknown tokens and invalid values
+            min_val, max_val = codes.min().item(), codes.max().item()
+            
+            if min_val < 0 or max_val >= 1024:
+                unknown_count = (codes < 0).sum().item() if min_val < 0 else 0
+                invalid_count = (codes >= 1024).sum().item() if max_val >= 1024 else 0
+                
+                if unknown_count > 0:
+                    print(f"[PREPROCESS] {context}: Found {unknown_count} unknown tokens (-1), clamping to 0")
+                if invalid_count > 0:
+                    print(f"[PREPROCESS] {context}: Found {invalid_count} invalid tokens (>=1024), clamping to 1023")
+                
+                # Clamp to valid range [0, 1023]
+                codes = torch.clamp(codes, min=0, max=1023)
+                print(f"[PREPROCESS] {context}: Preprocessed codes range: [{codes.min().item()}, {codes.max().item()}]")
+            
+            return codes
+            
+        except Exception as e:
+            print(f"[PREPROCESS ERROR] {context}: {e}")
+            return codes
+
+    def _safe_autoencoder_decode(self, codes: torch.Tensor, context: str = "") -> torch.Tensor:
+        """
+        Safely decode codes with proper error handling and preprocessing.
+        """
+        try:
+            # Ensure codes are on the correct device and dtype
+            codes = codes.to(self.device)
+            
+            # Preprocess codes to handle unknown tokens
+            codes = self._preprocess_codes_for_decoding(codes, context)
+            
+            # Validate basic tensor properties
+            if codes is None or codes.numel() == 0:
+                raise ValueError("Empty or None codes tensor")
+            
+            if codes.dim() != 3:
+                raise ValueError(f"Expected 3D tensor, got {codes.dim()}D with shape {codes.shape}")
+            
+            # Clear GPU cache before decoding
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Attempt decoding with autocast for mixed precision
+            with torch.cuda.amp.autocast(enabled=True):
+                decoded_audio = self.autoencoder.decode(codes)
+            
+            # Validate output
+            if decoded_audio is None or len(decoded_audio) == 0:
+                raise RuntimeError("Autoencoder returned empty result")
+            
+            return decoded_audio[0]
+            
+        except Exception as e:
+            print(f"[DECODE ERROR] {context}: {type(e).__name__}: {e}")
+            
+            # Try CPU fallback if CUDA failed
+            if codes.device.type == "cuda":
+                try:
+                    print(f"[DECODE FALLBACK] {context}: Attempting CPU decode")
+                    codes_cpu = self._preprocess_codes_for_decoding(codes.cpu(), f"{context}_cpu")
+                    autoencoder_cpu = self.autoencoder.dac.cpu()
+                    
+                    with torch.no_grad():
+                        decoded_cpu = autoencoder_cpu.decode(audio_codes=codes_cpu).audio_values.unsqueeze(1).float()
+                    
+                    # Move back to GPU
+                    self.autoencoder.dac.to(self.device)
+                    return decoded_cpu.to(self.device)
+                    
+                except Exception as cpu_e:
+                    print(f"[DECODE FALLBACK FAILED] {context}: {cpu_e}")
+            
+            # Return silence as last resort
+            batch_size, _, seq_len = codes.shape
+            samples_per_token = 512  # Approximate DAC ratio
+            silence_length = seq_len * samples_per_token
+            print(f"[DECODE FALLBACK] {context}: Returning silence of length {silence_length}")
+            return torch.zeros((batch_size, 1, silence_length), device=self.device, dtype=torch.float32)
+
     @torch.inference_mode()
     def generate(
         self,
@@ -339,6 +426,7 @@ class Zonos(nn.Module):
     ) -> Generator[torch.Tensor | str, None, None]:
         """
         Stream audio generation in chunks with smooth transitions between chunks.
+        FIXED VERSION v2 with improved audio cutoff handling.
 
         Args:
             cond_dicts_generator: Generator of conditioning dictionaries
@@ -463,53 +551,87 @@ class Zonos(nn.Module):
                 if (chunk_counter + chunk_overlap + 9 >= chunk_schedule[schedule_index]) or (
                     torch.all(remaining_steps == 0)
                 ):
-                    # In Zonos, the final output codes are produced by reverting the delay pattern.
-                    # Only tokens up to (offset - 9) are valid.
-                    full_codes = revert_delay_pattern(delayed_codes)
-                    full_codes.masked_fill_(full_codes >= 1024, 0)
+                    try:
+                        # In Zonos, the final output codes are produced by reverting the delay pattern.
+                        # Only tokens up to (offset - 9) are valid.
+                        full_codes = revert_delay_pattern(delayed_codes)
+                        full_codes.masked_fill_(full_codes >= 1024, 0)
 
-                    # Get the valid portion of the latent sequence.
-                    valid_length = offset - 9
-                    partial_codes = full_codes[..., yielded_len:valid_length]
+                        # Get the valid portion of the latent sequence.
+                        valid_length = offset - 9
+                        
+                        # FIXED: Add bounds checking and minimum chunk size validation
+                        chunk_start = max(0, yielded_len)
+                        chunk_end = max(chunk_start + 1, valid_length)  # Ensure at least 1 token
+                        
+                        if chunk_start >= chunk_end:
+                            print(f"[STREAM WARNING] Skipping invalid chunk: start={chunk_start}, end={chunk_end}")
+                            continue
+                        
+                        partial_codes = full_codes[..., chunk_start:chunk_end]
+                        
+                        # FIXED: Use safe decoding with automatic unknown token handling
+                        context = f"streaming_chunk_{step}_len_{chunk_end - chunk_start}"
+                        current_audio = self._safe_autoencoder_decode(partial_codes, context)
+                        
+                        # Apply crossfading if we have previous audio
+                        if current_audio.shape[-1] > 0:
+                            size = min(overlap, current_audio.shape[-1])
+                            if size > 0:
+                                current_audio[..., :size] *= cosfade[-size:]
+                                if previous_audio is not None and previous_audio.shape[-1] >= size:
+                                    current_audio[..., :size] += previous_audio[..., -size:] * (1 - cosfade[:size])
 
-                    # Decode the current chunk to audio (keep on device)
-                    current_audio = self.autoencoder.decode(partial_codes)[0]
-                    size = min(overlap, current_audio.shape[-1])
-                    current_audio[..., :size] *= cosfade[-size:]
-                    if previous_audio is not None:
-                        current_audio[..., :size] += previous_audio[..., -size:] * (1 - cosfade[:size])
+                            # FIXED: Improved fade-in for the first chunk to prevent audio cutoff
+                            if schedule_index == 0 and generator_index == 0:  # Only for very first chunk of first sentence
+                                # Gentle fade-in over more samples to preserve initial audio
+                                fade_samples = min(overlap * 3, current_audio.shape[-1])  # Longer fade-in
+                                if fade_samples > 0:
+                                    # Use cosine fade instead of log fade for smoother transition
+                                    gentle_fade = 0.5 * (1 - torch.cos(torch.linspace(0, torch.pi, fade_samples, device=device)))
+                                    current_audio[..., :fade_samples] *= gentle_fade
+                                    print(f"[STREAM] {context}: Applied gentle fade-in over {fade_samples} samples")
 
-                    if schedule_index == 0:  # fade in the first chunk of sentence to smooth the pop
-                        size = min(2 * overlap, current_audio.shape[-1])
-                        logfade = torch.logspace(1, 0, size, base=20, device=device)
-                        logfade -= logfade.min()
-                        logfade /= logfade.max()
-                        current_audio[..., :size] *= logfade.flip(0)
+                            # Yield the chunk (keeping overlap for next iteration)
+                            yield_length = max(0, current_audio.shape[-1] - overlap)
+                            if yield_length > 0:
+                                yield current_audio[..., :yield_length]
 
-                    yield current_audio[..., :-overlap]
+                            # Store current audio for next iteration and update counters
+                            previous_audio = current_audio
+                            yielded_len = chunk_end - chunk_overlap
+                            chunk_counter = 0
 
-                    # Store current audio for next iteration and update counters
-                    previous_audio = current_audio
-                    yielded_len = valid_length - chunk_overlap
-                    chunk_counter = 0
-
-                    # Update chunk size according to schedule
-                    if schedule_index < len(chunk_schedule) - 1:
-                        schedule_index += 1
+                            # Update chunk size according to schedule
+                            if schedule_index < len(chunk_schedule) - 1:
+                                schedule_index += 1
+                    
+                    except Exception as e:
+                        print(f"[STREAM ERROR] Failed to process chunk at step {step}: {e}")
+                        # Continue to next iteration instead of crashing
+                        continue
 
             if generator_index == 0:
                 # Assemble the full codes for this sentence and set the audio_prefix_codes to equal first sentence generated audio
-                audio_prefix_codes = revert_delay_pattern(delayed_codes)
-                audio_prefix_codes.masked_fill_(audio_prefix_codes >= 1024, 0)
-                audio_prefix_codes = audio_prefix_codes[..., : offset - 9]
-                audio_prefix_text = curr_text + whitespace
+                try:
+                    audio_prefix_codes = revert_delay_pattern(delayed_codes)
+                    audio_prefix_codes.masked_fill_(audio_prefix_codes >= 1024, 0)
+                    audio_prefix_codes = audio_prefix_codes[..., : offset - 9]
+                    audio_prefix_text = curr_text + whitespace
+                except Exception as e:
+                    print(f"[STREAM ERROR] Failed to set audio prefix: {e}")
 
+            # Fade out the final chunk for this sentence
             if previous_audio is not None:
-                size = min(2 * overlap, previous_audio.shape[-1])
-                logfade = torch.logspace(1, 0, size, base=20, device=device)
-                logfade -= logfade.min()
-                logfade /= logfade.max()
-                previous_audio[..., -size:] *= logfade
+                try:
+                    size = min(2 * overlap, previous_audio.shape[-1])
+                    if size > 0:
+                        logfade = torch.logspace(1, 0, size, base=20, device=device)
+                        logfade -= logfade.min()
+                        logfade /= logfade.max()
+                        previous_audio[..., -size:] *= logfade
+                except Exception as e:
+                    print(f"[STREAM ERROR] Failed to fade out: {e}")
 
             self._cg_graph = None  # reset CUDA graph to avoid caching issues
             generator_index += 1

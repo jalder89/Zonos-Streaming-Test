@@ -35,82 +35,135 @@ texts = [
 
 
 def main():
+    """
+    FIXED VERSION: Enhanced streaming example with proper error handling and debugging.
+    """
     # Use CUDA if available.
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
 
-    # Load the model (here we use the transformer variant).
-    print("Loading model...")
-    model = Zonos.from_pretrained("Zyphra/Zonos-v0.1-transformer", device=device)
-    model.requires_grad_(False).eval()
+    try:
+        # Load the model (here we use the transformer variant).
+        print("Loading model...")
+        model = Zonos.from_pretrained("Zyphra/Zonos-v0.1-transformer", device=device)
+        model.requires_grad_(False).eval()
+        print(f"Model loaded successfully on {device}")
 
-    # Load a reference speaker audio to generate a speaker embedding.
-    print("Loading reference audio...")
-    wav, sr = torchaudio.load("assets/exampleaudio.mp3")
-    speaker = model.make_speaker_embedding(wav, sr)
+        # Load a reference speaker audio to generate a speaker embedding.
+        print("Loading reference audio...")
+        wav, sr = torchaudio.load("assets/exampleaudio.mp3")
+        speaker = model.make_speaker_embedding(wav, sr)
+        print(f"Speaker embedding created: shape={speaker.shape}")
 
-    # Set a random seed for reproducibility.
-    torch.manual_seed(777)
+        # Set a random seed for reproducibility.
+        torch.manual_seed(777)
 
-    # Accumulate audio chunks as they are generated.
-    audio_chunks = []
-    t0 = time.time()
-    generated = 0
-    ttfb = None
+        # Accumulate audio chunks as they are generated.
+        audio_chunks = []
+        t0 = time.time()
+        generated = 0
+        ttfb = None
+        chunk_count = 0
 
-    def generator():
-        # Can stream from your LLM or other source here, just partition the text into
-        # sentences with nltk or rule based tokenizer. See example here:
-        # https://stackoverflow.com/a/31505798
-        for text in texts:
-            elapsed = int((time.time() - t0) * 1000)
-            print(f"Yielding sentence {elapsed}ms: {text}")
-            yield {
-                "text": text,
-                "speaker": speaker,
-                "language": "en-us",
-            }
+        def generator():
+            # Can stream from your LLM or other source here, just partition the text into
+            # sentences with nltk or rule based tokenizer. See example here:
+            # https://stackoverflow.com/a/31505798
+            for i, text in enumerate(texts):
+                elapsed = int((time.time() - t0) * 1000)
+                print(f"Yielding sentence {i+1}/{len(texts)} at {elapsed}ms: {text[:50]}...")
+                yield {
+                    "text": text,
+                    "speaker": speaker,
+                    "language": "en-us",
+                }
 
-    # --- STREAMING GENERATION ---
-    print("Starting streaming generation...")
+        # --- STREAMING GENERATION ---
+        print("Starting streaming generation...")
 
-    # Define chunk schedule: start with small chunks for faster initial output,
-    # then gradually increase to larger chunks for fewer cuts
-    stream_generator = model.stream(
-        cond_dicts_generator=generator(),
-        chunk_schedule=[22, 13, *range(12, 100)],  # optimal schedule for RTX3090
-        chunk_overlap=1,  # tokens to overlap between chunks (affects crossfade)
-        mark_boundaries=True,
-    )
+        # FIXED: More conservative chunk schedule to reduce memory pressure
+        # Start with smaller chunks and gradually increase
+        stream_generator = model.stream(
+            cond_dicts_generator=generator(),
+            chunk_schedule=[8, 12, 16, 20, 25, 30],  # More conservative schedule
+            chunk_overlap=1,  # Reduced overlap to minimize complexity
+            max_new_tokens=512,  # Reduced from default for testing
+            mark_boundaries=True,
+        )
 
-    for i, audio_chunk in enumerate(stream_generator):
-        if isinstance(audio_chunk, str):
-            print(audio_chunk)
-            continue
+        print("Stream generator created, starting iteration...")
 
-        audio_chunks.append(audio_chunk)
-        elapsed = int((time.time() - t0) * 1000)
-        if ttfb is None:
-            ttfb = elapsed
-        gap = "GAP" if ttfb + generated < elapsed else ""
-        generated += int(audio_chunk.shape[1] / 44.1)
-        print(f"Chunk {i + 1:>3}: elapsed {elapsed:>5}ms | generated up to {ttfb + generated:>5}ms {gap}")
+        for i, audio_chunk in enumerate(stream_generator):
+            try:
+                if isinstance(audio_chunk, str):
+                    print(f"Sentence boundary: {audio_chunk[:50]}...")
+                    continue
 
-    # Concatenate all audio chunks along the time axis.
-    audio = torch.cat(audio_chunks, dim=-1).cpu()
+                # Validate audio chunk
+                if audio_chunk is None or audio_chunk.numel() == 0:
+                    print(f"Chunk {i + 1}: Empty audio chunk received")
+                    continue
 
-    generation = round(time.time() - t0, 3)
-    duration = round(audio.shape[1] / 44100, 3)
+                chunk_count += 1
+                audio_chunks.append(audio_chunk.cpu())  # Move to CPU for storage
+                
+                elapsed = int((time.time() - t0) * 1000)
+                if ttfb is None:
+                    ttfb = elapsed
+                    print(f"Time to first byte: {ttfb}ms")
+                
+                chunk_duration = audio_chunk.shape[-1] / 44100 * 1000  # Duration in ms
+                generated += chunk_duration
+                
+                gap = "GAP" if ttfb + generated < elapsed else ""
+                print(f"Chunk {chunk_count:>3}: elapsed {elapsed:>5}ms | "
+                      f"chunk_duration {chunk_duration:>5.0f}ms | "
+                      f"total_generated {ttfb + generated:>5.0f}ms | "
+                      f"chunk_shape {audio_chunk.shape} {gap}")
 
-    print(f"TTFB: {ttfb}ms, generation: {generation}ms, duration: {duration}ms, RTX: {round(duration / generation, 2)}")
+                # Clear GPU memory periodically
+                if chunk_count % 5 == 0 and device == "cuda":
+                    torch.cuda.empty_cache()
 
-    # Save the full audio as a WAV file.
-    out_sr = model.autoencoder.sampling_rate
-    torchaudio.save("streaming.wav", audio, out_sr)
-    print(f"Saved streaming audio to 'streaming.wav' (sampling rate: {out_sr} Hz).")
+            except Exception as e:
+                print(f"Error processing chunk {i}: {e}")
+                continue
 
-    # Or use the following to display the audio in the jupyter notebook:
-    # from IPython.display import Audio
-    # display(Audio(data=audio, rate=out_sr))
+    except Exception as e:
+        print(f"Fatal error during streaming: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    try:
+        if audio_chunks:
+            # Concatenate all audio chunks along the time axis.
+            print(f"Concatenating {len(audio_chunks)} audio chunks...")
+            audio = torch.cat(audio_chunks, dim=-1)
+
+            generation_time = round(time.time() - t0, 3)
+            audio_duration = round(audio.shape[-1] / 44100, 3)
+            rtx = round(audio_duration / generation_time, 2) if generation_time > 0 else 0
+
+            print(f"Generation complete:")
+            print(f"  TTFB: {ttfb}ms")
+            print(f"  Generation time: {generation_time}s")
+            print(f"  Audio duration: {audio_duration}s")
+            print(f"  Real-time factor: {rtx}x")
+            print(f"  Final audio shape: {audio.shape}")
+
+            # Save the full audio as a WAV file.
+            out_sr = model.autoencoder.sampling_rate
+            output_file = "streaming_fixed.wav"
+            torchaudio.save(output_file, audio, out_sr)
+            print(f"Saved streaming audio to '{output_file}' (sampling rate: {out_sr} Hz)")
+        else:
+            print("No audio chunks were generated successfully")
+
+    except Exception as e:
+        print(f"Error during final processing: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":

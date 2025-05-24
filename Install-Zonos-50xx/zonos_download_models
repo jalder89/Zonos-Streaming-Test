@@ -1,6 +1,0 @@
-#!/bin/bash
-
-cd /home/dwemer/Zonos
-python3 -m venv .
-
-./bin/uv run download_models.py
